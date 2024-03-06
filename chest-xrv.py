@@ -20,8 +20,8 @@ app = Flask(__name__)
 
 # AWS 설정
 bucket_name = 'bucket-name'
-AWS_ACCESS_KEY_ID = 'access-name'
-AWS_SECRET_ACCESS_KEY = 'secret-access-name'
+AWS_ACCESS_KEY_ID = 'access-key'
+AWS_SECRET_ACCESS_KEY = 'secret-access-key'
 
 aws_region = 'region'
 
@@ -50,13 +50,11 @@ DOWNLOADS_FOLDER = 'downloads'
 if not os.path.exists(DOWNLOADS_FOLDER):
     os.makedirs(DOWNLOADS_FOLDER)
 
-
-def upload_file_to_s3(image_path, bucket_name, result_file_name):
-    s3.upload_file(result_file_name, bucket_name, result_file_name)
-    print(f"Uploaded image to S3: {result_file_name}")
-    file_url = f"https://{bucket_name}.s3.{aws_region}.amazonaws.com/{result_file_name}"
+def upload_file_to_s3(image_path, bucket_name, s3_file_name):
+    s3.upload_file(image_path, bucket_name, s3_file_name)
+    print(f"Uploaded image to S3: {s3_file_name}")
+    file_url = f"https://{bucket_name}.s3.{aws_region}.amazonaws.com/{s3_file_name}"
     return file_url
-
 
 def download_image_from_url(url: str, file_name: str) -> bool:
     """
@@ -152,7 +150,8 @@ def inference_images(images: list[torch.Tensor], model: torch.nn.Module) -> np.n
 
 def post_process_with_prob(prob: np.ndarray, threshold: float = 0.45) -> tuple[list[str], list[str]]:
     results_prob: dict[str, float] = dict(zip(_LESION_TO_CAMID.keys(), prob))
-    results_prob: dict[str, float] = {k: float(v) for k, v in sorted(results_prob.items()) if k in _TARGET_LESIONS}
+    # results_prob: dict[str, float] = {k: float(v) for k, v in sorted(results_prob.items()) if k in _TARGET_LESIONS}
+    results_prob: dict[str, float] = {k: float(v) for k, v in results_prob.items() if k in _TARGET_LESIONS}
 
     # results_label = [f'{k}: {v:.2f}%' for k, v in results_prob.items() if v > threshold]
     # NOTE: 급하게 max값만 사용하도록 수정
@@ -211,6 +210,7 @@ def inference_images_for_lung_seg(image: torch.Tensor, threshold: float = 0.5) -
 def process_image_route():
     image_url = request.json.get('image_url')
     original_file_name = os.path.basename(image_url)
+    present_file_name = original_file_name.split('.')[0] + '_medit.' + original_file_name.split('.')[1]
     file_name = os.path.join(DOWNLOADS_FOLDER, original_file_name)  # 파일 저장 경로 설정
 
     success, file_name = download_image_from_url(image_url, file_name)
@@ -268,26 +268,29 @@ def process_image_route():
     if _VERBOSE:
         print(f"Detected labels: {detected_labels}")
 
-    if 'normal' in detected_labels:
-        return jsonify({'s3_url': None, 'result': results_prob, 'label': results_label})
+    s3_url = None  # 기본값으로 None 설정
 
-    # if lesion in results_label else 'normal' then draw cam
-    cam_images: dict[str, np.ndarray] = get_cam_per_lesion(detected_labels, normailized_images,
-                                                           target_shape=(image.shape[1], image.shape[0]))
-    draws = [cv2.cvtColor(copy.deepcopy(image), cv2.COLOR_GRAY2BGR).astype(np.uint8) for _ in detected_labels]
-    overlays = {lesion: cv2.addWeighted(draw, 0.7, cam, 0.3, 0)
-                for draw, (lesion, cam) in zip(draws, cam_images.items())}
+    if 'normal' not in detected_labels:
+        # if lesion in results_label else 'normal' then draw cam
+        cam_images: dict[str, np.ndarray] = get_cam_per_lesion(detected_labels, normailized_images,
+                                                               target_shape=(image.shape[1], image.shape[0]))
+        draws = [cv2.cvtColor(copy.deepcopy(image), cv2.COLOR_GRAY2BGR).astype(np.uint8) for _ in detected_labels]
+        overlays = {lesion: cv2.addWeighted(draw, 0.7, cam, 0.3, 0)
+                    for draw, (lesion, cam) in zip(draws, cam_images.items())}
 
-    for lesion, overlay in overlays.items():
-        result_file_name = f'{Path(file_name).stem}_{lesion}.jpg'
-        cv2.imwrite(result_file_name, cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
-        uploaded = upload_file_to_s3(file_name, 'medit-static-files', result_file_name)
+        for lesion, overlay in overlays.items():
+            result_file_name = f'{Path(file_name).stem}_{lesion}.jpg'
+            cv2.imwrite(result_file_name, cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+            uploaded = upload_file_to_s3(result_file_name, 'medit-static-files', result_file_name)
+            if uploaded:
+                s3_url = (f"https://medit-static-files.s3.ap-northeast-2.amazonaws.com/{result_file_name}")
+
+    else:
+        uploaded = upload_file_to_s3(file_name, 'medit-static-files', present_file_name)
         if uploaded:
-            s3_url=(f"https://medit-static-files.s3.ap-northeast-2.amazonaws.com/{result_file_name}")
-        os.remove(result_file_name)
+            s3_url = f"https://medit-static-files.s3.ap-northeast-2.amazonaws.com/{present_file_name}"
 
     return jsonify({'s3_url': s3_url, 'result': results_prob, 'label': results_label})
-
 
 if __name__ == '__main__':
     app.run(debug=False, host='0.0.0.0')
